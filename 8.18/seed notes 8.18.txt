@@ -1,0 +1,24 @@
+[awidvb@kservbld-dp05 ProjDraft]$ g++ seed.cpp -o seed -lpthread
+[awidvb@kservbld-dp05 ProjDraft]$ ./seed
+
+Finding available ports ... Found port 9005
+Listening at port 9005
+
+>./seed
+[1] List available files.
+[2] Download file.
+[3] Download status.
+[4] Exit.
+Choose an option: 1
+
+Searching files ... done.
+Files available:
+[1] blabla.txt
+[2] sample text.txt
+
+>./seed
+[1] List available files.
+[2] Download file.
+[3] Download status.
+[4] Exit.
+Choose an option:
