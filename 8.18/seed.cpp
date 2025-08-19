@@ -311,7 +311,7 @@ g++ seed.cpp -o seed -lpthread
 #define START_PORT 9005
 #define END_PORT 9009
 
-std::string base_seed_path = "C:/Users/USER/Downloads/8.18/8.18/files";
+std::string base_seed_path = "/mnt/c/Users/USER/Downloads/8.18/8.18/files";
 std::map<int, std::string> port_to_seed = {
     {9005, "seed1"},
     {9006, "seed2"}, 
@@ -347,29 +347,33 @@ int find_available_port(int& server_fd, sockaddr_in& address) {
     return -1;
 }
 
-// RECURSIVE LIST FILES
+// RECURSIVE LIST FILES - Fixed for nested structure
 void list_files_recursive(const std::string& path, std::vector<std::string>& files, const std::string& seed_info = "", const std::string& key_id = "") {
+    std::cout << "DEBUG: Trying to open directory: " << path << std::endl; // Debug line
     DIR* dir = opendir(path.c_str()); 
     if (!dir) {
-        std::cerr << "Failed to open directory: " << path << "\n";
+        std::cout << "DEBUG: Failed to open directory: " << path << std::endl; // Debug line
         return;
     }
+    std::cout << "DEBUG: Successfully opened directory: " << path << std::endl; // Debug line
 
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {  
         std::string name = entry->d_name;
         if (name == "." || name == "..") continue;
 
-        std::string full_path = path + "/" + name;
+        std::string full_path = path + "/" + name; // Changed to forward slash
 
         struct stat st;
         if (stat(full_path.c_str(), &st) == -1) continue;
 
         if (S_ISDIR(st.st_mode)) {
-            std::string current_key_id = key_id.empty() ? name : key_id;
+            // This is a directory - treat it as a Key ID folder
+            std::string current_key_id = name; // Use the folder name as Key ID
             std::string enhanced_seed_info = seed_info + " [Key ID: " + current_key_id + "]";
             list_files_recursive(full_path, files, enhanced_seed_info, current_key_id);
         } else if (S_ISREG(st.st_mode)) {
+            // This is a file
             std::string final_seed_info = seed_info;
             if (!key_id.empty()) {
                 final_seed_info += " [Key ID: " + key_id + "]";
@@ -389,12 +393,13 @@ std::vector<std::string> list_files_from_other_ports(int current_port) {
         std::string seed_folder = port_seed_pair.second;
         
         if (port == current_port) {
-            continue;
+            continue; // Skip current port
         }
         
         std::string full_seed_path = base_seed_path + "/" + seed_folder;
         std::cout << "Scanning port " << port << " folder: " << full_seed_path << "\n";
         
+        // Check if seed folder exists
         DIR* test_dir = opendir(full_seed_path.c_str());
         if (!test_dir) {
             std::cout << "Directory not found or inaccessible: " << full_seed_path << "\n";
@@ -440,7 +445,13 @@ void handle_client(int client_socket, int current_port) {
         std::string filepath = file_entry.substr(0, separator);
         std::string info = (separator != std::string::npos) ? file_entry.substr(separator + 1) : "";
         
-        std::string display_name = filepath.substr(filepath.find_last_of("/") + 1);
+        // Extract just the filename from the full path
+        std::string display_name = filepath;
+        size_t last_slash = filepath.find_last_of("/");
+        if (last_slash != std::string::npos) {
+            display_name = filepath.substr(last_slash + 1);
+        }
+        
         file_list_msg += "[" + std::to_string(i + 1) + "] " + display_name + " (" + info + ")\n";
     }
     send(client_socket, file_list_msg.c_str(), file_list_msg.size(), 0);
@@ -457,7 +468,11 @@ void handle_client(int client_socket, int current_port) {
     std::string file_entry = available_files[file_id - 1];
     size_t separator = file_entry.find("|");
     std::string filepath = file_entry.substr(0, separator);
-    std::string filename = filepath.substr(filepath.find_last_of("/") + 1);
+    std::string filename = filepath;
+    size_t last_slash = filepath.find_last_of("/");
+    if (last_slash != std::string::npos) {
+        filename = filepath.substr(last_slash + 1);
+    }
 
     char exists_flag;
     recv(client_socket, &exists_flag, sizeof(exists_flag), 0);
@@ -560,7 +575,11 @@ int main() {
                     std::string filepath = file_entry.substr(0, separator);
                     std::string info = (separator != std::string::npos) ? file_entry.substr(separator + 1) : "";
                     
-                    std::string filename = filepath.substr(filepath.find_last_of("/") + 1);
+                    std::string filename = filepath;
+                    size_t last_slash = filepath.find_last_of("/");
+                    if (last_slash != std::string::npos) {
+                        filename = filepath.substr(last_slash + 1);
+                    }
                     std::cout << "[" << i + 1 << "] " << filename << " (" << info << ")\n";
                 }
             }
