@@ -29,6 +29,7 @@ g++ seed.cpp -o seed -lpthread
 const size_t CHUNK_SIZE = 32;  // Changed from #define to const size_t for type safety
 
 std::string base_seed_path = "/mnt/c/Users/USER/Downloads/8.18/8.18/files";
+
 std::map<int, std::string> port_to_seed = {
     {9005, "seed1"},
     {9006, "seed2"}, 
@@ -610,12 +611,12 @@ int main() {
             }
             
             // Display available Key IDs
-            std::cout << "\nAvailable File IDs:\n";
+            std::cout << "\nAvailable Files:\n";
             std::vector<std::string> key_ids;
             for (const auto& entry : files_by_key_id) {
                 key_ids.push_back(entry.first);
-                std::cout << "[" << key_ids.size() << "] Key ID: " << entry.first 
-                         << " (" << entry.second.size() << " files)\n";
+                //std::cout << "[" << key_ids.size() << "] Key ID: " << entry.first << " (" << entry.second.size() << " files)\n";
+                std::cout << "[" << entry.first << "]";
                 
                 // Show files in this key_id
                 for (const auto& file : entry.second) {
@@ -624,22 +625,100 @@ int main() {
                     if (last_slash != std::string::npos) {
                         filename = file.filepath.substr(last_slash + 1);
                     }
-                    std::cout << "    - " << filename << " (" << file.file_size << " bytes)\n";
+                    std::cout << " " << filename << " (" << file.file_size << " bytes)\n";
                 }
             }
             
-            std::cout << "\nChoose File ID: ";
-            int file_id_choice;
-            std::cin >> file_id_choice;
-            std::cin.ignore();
+            std::cout << "\nEnter File ID: ";
+            std::string file_id_input;
+            std::getline(std::cin, file_id_input);
             
-            if (file_id_choice < 1 || file_id_choice > key_ids.size()) {
+            std::string selected_key_id;
+            bool found_key_id = false;
+            
+            // First try to find direct key_id match
+            if (files_by_key_id.find(file_id_input) != files_by_key_id.end()) {
+                selected_key_id = file_id_input;
+                found_key_id = true;
+            } else {
+                // Try to parse as number and get key_id by index
+                try {
+                    int file_id_choice = std::stoi(file_id_input);
+                    if (file_id_choice >= 1 && file_id_choice <= key_ids.size()) {
+                        selected_key_id = key_ids[file_id_choice - 1];
+                        found_key_id = true;
+                    }
+                } catch (const std::exception&) {
+                    // Invalid input
+                }
+            }
+            
+            if (!found_key_id) {
                 std::cout << "Invalid File ID.\n";
                 continue;
             }
             
-            std::string selected_key_id = key_ids[file_id_choice - 1];
             std::vector<FileInfo>& selected_files = files_by_key_id[selected_key_id];
+            
+            std::cout << "Locating seeders..";
+            std::flush(std::cout);
+            
+            // Count how many active ports actually have files from this key_id
+            int seeders_with_files = 0;
+            for (int active_port : active_ports) {
+                std::vector<FileInfo> port_files = request_files_from_port(active_port);
+                bool has_key_id_files = false;
+                for (const auto& file : port_files) {
+                    if (file.key_id == selected_key_id) {
+                        has_key_id_files = true;
+                        break;
+                    }
+                }
+                if (has_key_id_files) {
+                    seeders_with_files++;
+                }
+            }
+            
+            if (seeders_with_files == 0) {
+                std::cout << " No seeders for File ID " << selected_key_id << "\n";
+                continue;
+            }
+            
+            std::cout << " Found " << seeders_with_files << " seeders\n";
+            
+            bool any_download_active = false;
+            std::vector<std::string> active_file_names;
+            {
+                std::lock_guard<std::mutex> lock(download_mutex);
+                for (const auto& file : selected_files) {
+                    std::string filename = file.filepath;
+                    size_t last_slash = file.filepath.find_last_of("/");
+                    if (last_slash != std::string::npos) {
+                        filename = file.filepath.substr(last_slash + 1);
+                    }
+                    
+                    if (active_downloads[filename]) {
+                        any_download_active = true;
+                        active_file_names.push_back(filename);
+                    }
+                }
+            }
+            
+            if (any_download_active) {
+                for (const auto& filename : active_file_names) {
+                    std::cout << "Download for file: " << filename << " is already started\n";
+                }
+                continue;
+            }
+            
+            for (const auto& file : selected_files) {
+                std::string filename = file.filepath;
+                size_t last_slash = file.filepath.find_last_of("/");
+                if (last_slash != std::string::npos) {
+                    filename = file.filepath.substr(last_slash + 1);
+                }
+                std::cout << "Download started. File: " << filename << "\n";
+            }
             
             auto it = port_to_seed.find(port);
             if (it == port_to_seed.end()) {
@@ -649,7 +728,7 @@ int main() {
             std::string current_seed_folder = base_seed_path + "/" + it->second;
             
             // Download all files in the selected Key ID simultaneously
-            std::cout << "\nDownloading " << selected_files.size() << " files from Key ID: " << selected_key_id << "\n";
+            std::cout << "Downloading " << selected_files.size() << " files from Key ID: " << selected_key_id << "\n";
             std::cout << "Saving to: " << current_seed_folder << "/" << selected_key_id << "/\n";
             
             std::vector<std::thread> file_download_threads;
