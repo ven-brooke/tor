@@ -24,13 +24,15 @@ g++ seed.cpp -o seed -lpthread
 #include <mutex>
 #include <atomic>
 
+//==CONFIG CONSTANTS=====
 #define START_PORT 9005
 #define END_PORT 9009
-const size_t CHUNK_SIZE = 32;  // Changed from #define to const size_t for type safety
+const size_t CHUNK_SIZE = 32; // safer than #define, defines size of each chunk in bytes
 
 std::string base_seed_path = "/mnt/c/Users/USER/Downloads/8.18/8.18/files";
+// std::string base_seed_path = "/data1/p4work/awidvb/Exercise/ProjDraft/files";
 
-std::map<int, std::string> port_to_seed = {
+std::map<int, std::string> port_to_seed = { // maps port -> seed folder
     {9005, "seed1"},
     {9006, "seed2"}, 
     {9007, "seed3"},
@@ -38,38 +40,39 @@ std::map<int, std::string> port_to_seed = {
     {9009, "seed5"}
 };
 
-std::map<std::string, std::string> download_status;
-std::map<std::string, bool> active_downloads;
-std::mutex download_mutex; // Added mutex for thread-safe download operations
+std::map<std::string, std::string> download_status;  // file -> status message  
+std::map<std::string, bool> active_downloads;        // file -> true if download is active
+std::mutex download_mutex;                           // mutex for thread-safe download operations
 
-struct FileInfo {
+// =====FILE AND CHUNK INFORMATION=====
+struct FileInfo {           // file info stored by a seeder
     std::string filepath;
     std::string key_id;
-    size_t file_size;
-    std::string seed_info;
+    size_t file_size;       // File size in bytes
+    std::string seed_info;  // Seed info
 };
 
-struct ChunkDownload {
-    int chunk_id;
-    int port;
-    size_t start_offset;
-    size_t chunk_size;
-    std::vector<char> data;
-    bool completed;
+struct ChunkDownload {      // chunk info stored by a seeder
+    int chunk_id;           
+    int port;               
+    size_t start_offset;    // byte offset of chunk in file
+    size_t chunk_size;      // size of chunk in bytes (32 bytes)
+    std::vector<char> data; // data of chunk
+    bool completed;         // true if chunk is downloaded
     
-    ChunkDownload(int id, int p, size_t start, size_t size) 
-        : chunk_id(id), port(p), start_offset(start), chunk_size(size), completed(false) {
+    ChunkDownload(int id, int p, size_t start, size_t size)     
+            : chunk_id(id), port(p), start_offset(start), chunk_size(size), completed(false) {
         data.resize(size);
     }
 };
-
+// =====PORT HANDLING FUNCTIONS=====
 int find_available_port(int& server_fd, sockaddr_in& address) {
     int opt = 1;
     for (int port = START_PORT; port <= END_PORT; ++port) {
         server_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (server_fd < 0) continue;
 
-        if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) { //Reuse address to avoid "port already in use"
             close(server_fd);
             continue;
         }
@@ -77,62 +80,59 @@ int find_available_port(int& server_fd, sockaddr_in& address) {
         address.sin_family = AF_INET;
         address.sin_addr.s_addr = INADDR_ANY;
         address.sin_port = htons(port);
-
-        if (bind(server_fd, (sockaddr*)&address, sizeof(address)) == 0) {
+        if (bind(server_fd, (sockaddr*)&address, sizeof(address)) == 0) { //Bind to port if free
             return port;
         }
-
         close(server_fd);
     }
-    return -1;
+    return -1; // No available port found
 }
 
-bool is_port_active(int port) {
+bool is_port_active(int port) { // Check if port is active
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return false;
     
-    sockaddr_in addr{};
+    sockaddr_in addr{}; 
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1"); // Localhost
     addr.sin_port = htons(port);
     
-    bool active = (connect(sock, (sockaddr*)&addr, sizeof(addr)) == 0);
+    bool active = (connect(sock, (sockaddr*)&addr, sizeof(addr)) == 0); // Connect to port
     close(sock);
-    return active;
+    return active; 
 }
 
 std::vector<int> get_active_ports(int current_port) {
-    std::vector<int> active_ports;
-    for (const auto& port_seed_pair : port_to_seed) {
-        int port = port_seed_pair.first;
+    std::vector<int> active_ports;                          // List of active ports
+    for (const auto& port_seed_pair : port_to_seed) {       
+        int port = port_seed_pair.first;                    // Get port number
         if (port != current_port && is_port_active(port)) {
-            active_ports.push_back(port);
+            active_ports.push_back(port);                   // Add active port to list
         }
     }
     return active_ports;
 }
-
+//== FILE LISTING FUNCTIONS=====
 void list_files_recursive(const std::string& path, std::vector<FileInfo>& files, const std::string& seed_info = "", const std::string& key_id = "") {
-    DIR* dir = opendir(path.c_str()); 
+    DIR* dir = opendir(path.c_str());  
     if (!dir) {
-        return;
+        return; // Return if directory cannot be opened
     }
-
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {  
         std::string name = entry->d_name;
-        if (name == "." || name == "..") continue;
+        if (name == "." || name == "..") continue; // Skip current and parent directories
 
         std::string full_path = path + "/" + name; 
 
         struct stat st;
-        if (stat(full_path.c_str(), &st) == -1) continue;
+        if (stat(full_path.c_str(), &st) == -1) continue; // Skip if file cannot be opened
 
         if (S_ISDIR(st.st_mode)) {
             // directory - use folder name as Key ID
             std::string current_key_id = name;
             std::string enhanced_seed_info = "[" + current_key_id + "] " + seed_info; 
-            list_files_recursive(full_path, files, enhanced_seed_info, current_key_id);
+            list_files_recursive(full_path, files, enhanced_seed_info, current_key_id); // Recursively list files in subdirectories
         } else if (S_ISREG(st.st_mode)) {
             // regular file - create FileInfo with size
             FileInfo file_info;
@@ -146,19 +146,17 @@ void list_files_recursive(const std::string& path, std::vector<FileInfo>& files,
     closedir(dir);
 }
 
-std::vector<FileInfo> get_local_files(int current_port) {
+std::vector<FileInfo> get_local_files(int current_port) { // Get files from CURRENT port
     std::vector<FileInfo> files;
-    
-    auto it = port_to_seed.find(current_port);
+    auto it = port_to_seed.find(current_port); // Find port in port_to_seed map
     if (it == port_to_seed.end()) {
         std::cout << "[DEBUG] Port " << current_port << " not found in port_to_seed map" << std::endl;
-        return files;
+        return files; // Return if port not found
     }
     
-    std::string seed_folder = it->second;
-    std::string full_seed_path = base_seed_path + "/" + seed_folder;
-    
-    DIR* test_dir = opendir(full_seed_path.c_str());
+    std::string seed_folder = it->second; // Get SEED# folder from port_to_seed map
+    std::string full_seed_path = base_seed_path + "/" + seed_folder; 
+    DIR* test_dir = opendir(full_seed_path.c_str()); // Open seed directory
     if (!test_dir) {
         std::cout << "[DEBUG] Failed to open directory: " << full_seed_path << " (errno: " << errno << ")" << std::endl;
         return files;
@@ -166,14 +164,12 @@ std::vector<FileInfo> get_local_files(int current_port) {
     closedir(test_dir);
     
     std::string seed_info;
-    list_files_recursive(full_seed_path, files, seed_info, "");
-    
+    list_files_recursive(full_seed_path, files, seed_info, ""); // List files in seed directory
     return files;
 }
 
-std::vector<FileInfo> request_files_from_port(int port) {
+std::vector<FileInfo> request_files_from_port(int port) { // Request files from port
     std::vector<FileInfo> files;
-    
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         return files;
@@ -182,55 +178,53 @@ std::vector<FileInfo> request_files_from_port(int port) {
     struct timeval timeout;
     timeout.tv_sec = 2;
     timeout.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)); // Set timeout for socket
+
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    addr.sin_port = htons(port);
+    addr.sin_port = htons(port); 
     
-    if (connect(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (connect(sock, (sockaddr*)&addr, sizeof(addr)) < 0) { // Connect to port
         close(sock);
         return files;
     }
-    
     std::string request = "LIST_FILES";
-    if (send(sock, request.c_str(), request.size(), 0) < 0) {
+    if (send(sock, request.c_str(), request.size(), 0) < 0) { // request file list to port
         close(sock);
         return files;
     }
     
-    std::string response;
-    char buffer[1024];
-    int bytes_received;
+    std::string response;   // Response from port
+    char buffer[1024];      // Buffer to store response
+    int bytes_received;     // Number of bytes received
     
-    while ((bytes_received = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
-        buffer[bytes_received] = '\0';
-        response += std::string(buffer);
+    while ((bytes_received = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) { // Receive response from port
+        buffer[bytes_received] = '\0'; // Add null terminator to end of buffer
+        response += std::string(buffer); 
     }
-    
     close(sock);
     
-    if (!response.empty()) {
+    // Parse response 
+    if (!response.empty()) { // If response is not empty
         std::istringstream iss(response);
         std::string line;
         while (std::getline(iss, line)) {
             if (!line.empty() && line != "END_LIST") {
                 // Parse the enhanced file info: filepath|key_id|size|seed_info
-                std::istringstream line_stream(line);
-                std::string filepath, key_id, size_str, seed_info;
-                
-                if (std::getline(line_stream, filepath, '|') &&
+                std::istringstream line_stream(line);               // Create stream from line
+                std::string filepath, key_id, size_str, seed_info;  
+                if (std::getline(line_stream, filepath, '|') && 
                     std::getline(line_stream, key_id, '|') &&
                     std::getline(line_stream, size_str, '|') &&
                     std::getline(line_stream, seed_info)) {
                     
-                    FileInfo file_info;
+                    FileInfo file_info; 
                     file_info.filepath = filepath;
                     file_info.key_id = key_id;
-                    file_info.file_size = std::stoull(size_str);
+                    file_info.file_size = std::stoull(size_str); 
                     file_info.seed_info = seed_info;
-                    files.push_back(file_info);
+                    files.push_back(file_info); // Add file info to files vector
                 }
             }
         }
@@ -238,25 +232,25 @@ std::vector<FileInfo> request_files_from_port(int port) {
     
     return files;
 }
-
-bool send_all(int sock, const char* buffer, size_t length) {
-    size_t total_sent = 0;
-    while (total_sent < length) {
+//== CHUNK DOWNLOAD FUNCTIONS=====
+bool send_all(int sock, const char* buffer, size_t length) { // Send all data to port
+    size_t total_sent = 0;            // Total bytes sent
+    while (total_sent < length) {     // Send data in chunks
         ssize_t sent = send(sock, buffer + total_sent, length - total_sent, 0);
-        if (sent <= 0) return false;
-        total_sent += sent;
+        if (sent <= 0) return false;  
+        total_sent += sent;           // Addto total bytes sent
     }
-    return true;
+    return true; 
 }
 
-bool recv_all(int sock, char* buffer, size_t length) {
-    size_t total_received = 0;
-    while (total_received < length) {
+bool recv_all(int sock, char* buffer, size_t length) { // Receive all data from port
+    size_t total_received = 0;         // Total bytes received
+    while (total_received < length) {  // Receive data in chunks
         ssize_t bytes = recv(sock, buffer + total_received, length - total_received, 0);
-        if (bytes <= 0) return false;
-        total_received += bytes;
+        if (bytes <= 0) return false; 
+        total_received += bytes;      // Add to total bytes received
     }
-    return true;
+    return true; 
 }
 
 bool download_chunk_from_port(int port, const std::string& filepath, ChunkDownload& chunk) {
@@ -272,7 +266,6 @@ bool download_chunk_from_port(int port, const std::string& filepath, ChunkDownlo
         close(sock);
         return false;
     }
-    
     // Send chunk request: "DOWNLOAD_CHUNK|filepath|start_offset|chunk_size"
     std::string request = "DOWNLOAD_CHUNK|" + filepath + "|" + 
                          std::to_string(chunk.start_offset) + "|" + 
@@ -282,7 +275,6 @@ bool download_chunk_from_port(int port, const std::string& filepath, ChunkDownlo
         close(sock);
         return false;
     }
-    
     // Receive chunk data
     if (!recv_all(sock, chunk.data.data(), chunk.chunk_size)) {
         close(sock);
@@ -293,7 +285,7 @@ bool download_chunk_from_port(int port, const std::string& filepath, ChunkDownlo
     chunk.completed = true;
     return true;
 }
-
+//== CLIENT HANDLING FUNCTIONS=====
 void handle_client(int client_socket, int current_port) {
     char buffer[1024];
     int bytes_received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
@@ -304,24 +296,22 @@ void handle_client(int client_socket, int current_port) {
     
     buffer[bytes_received] = '\0';
     std::string request(buffer);
-    
-    if (request == "LIST_FILES") {
+    if (request == "LIST_FILES") { // List files from current port
         std::vector<FileInfo> local_files = get_local_files(current_port);
         
         std::string response;
-        for (const auto& file_info : local_files) {
+        for (const auto& file_info : local_files) { // Send file info to client
             // Send: filepath|key_id|size|seed_info
             response += file_info.filepath + "|" + file_info.key_id + "|" + 
                        std::to_string(file_info.file_size) + "|" + file_info.seed_info + "\n";
         }
         response += "END_LIST\n";
         
-        send_all(client_socket, response.c_str(), response.size());
+        send_all(client_socket, response.c_str(), response.size()); // Send response to client
         close(client_socket);
         return;
     }
-    
-    if (request.substr(0, 14) == "DOWNLOAD_CHUNK") {
+    if (request.substr(0, 14) == "DOWNLOAD_CHUNK") { // Download chunk from client
         std::istringstream iss(request);
         std::string command, filepath, start_str, size_str;
         
@@ -333,14 +323,14 @@ void handle_client(int client_socket, int current_port) {
             size_t start_offset = std::stoull(start_str);
             size_t chunk_size = std::stoull(size_str);
             
-            std::ifstream file(filepath, std::ios::binary);
+            std::ifstream file(filepath, std::ios::binary); // Open file
             if (file) {
                 file.seekg(start_offset);
                 std::vector<char> chunk_data(chunk_size);
                 file.read(chunk_data.data(), chunk_size);
                 size_t bytes_read = file.gcount();
                 
-                send_all(client_socket, chunk_data.data(), bytes_read);
+                send_all(client_socket, chunk_data.data(), bytes_read); // Send chunk data to client
             }
             file.close();
         }
@@ -348,25 +338,24 @@ void handle_client(int client_socket, int current_port) {
         return;
     }
 
-    // ... existing code for regular file operations ...
-    std::vector<FileInfo> available_files;
-    std::vector<int> active_ports = get_active_ports(current_port);
-    for (int active_port : active_ports) {
-        std::vector<FileInfo> port_files = request_files_from_port(active_port);
-        available_files.insert(available_files.end(), port_files.begin(), port_files.end());
+    std::vector<FileInfo> available_files; // List of available files
+    std::vector<int> active_ports = get_active_ports(current_port); // Get active ports
+    for (int active_port : active_ports) { // Iterate through active ports
+        std::vector<FileInfo> port_files = request_files_from_port(active_port); // Request files from port
+        available_files.insert(available_files.end(), port_files.begin(), port_files.end()); // Add files to available files
     }
     
     std::string file_list_msg = "Files available:\n";
     for (size_t i = 0; i < available_files.size(); ++i) {
         const FileInfo& file_info = available_files[i];
         
-        std::string display_name = file_info.filepath;
+        std::string display_name = file_info.filepath; 
         size_t last_slash = file_info.filepath.find_last_of("/");
         if (last_slash != std::string::npos) {
             display_name = file_info.filepath.substr(last_slash + 1);
         }
         
-        file_list_msg += "[" + std::to_string(i + 1) + "] " + display_name + 
+        file_list_msg += "[" + std::to_string(i + 1) + "] " + display_name +  
                         " (" + std::to_string(file_info.file_size) + " bytes) " +
                         file_info.seed_info + "\n";
     }
@@ -381,14 +370,14 @@ void handle_client(int client_socket, int current_port) {
         return;
     }
 
-    const FileInfo& selected_file = available_files[file_id - 1];
+    const FileInfo& selected_file = available_files[file_id - 1]; 
     std::string filename = selected_file.filepath;
     size_t last_slash = selected_file.filepath.find_last_of("/");
     if (last_slash != std::string::npos) {
         filename = selected_file.filepath.substr(last_slash + 1);
     }
 
-    char exists_flag;
+    char exists_flag; // Check if file exists
     recv(client_socket, &exists_flag, sizeof(exists_flag), 0);
     if (exists_flag == '1') {
         std::string msg = "File " + filename + " already exists\n";
@@ -406,13 +395,13 @@ void handle_client(int client_socket, int current_port) {
         active_downloads[filename] = true;
     }
 
-    size_t file_size = selected_file.file_size;
-    size_t total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    size_t file_size = selected_file.file_size; 
+    size_t total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE; 
     
     std::string seeder_msg = "Enter file ID:\nLocating seeders... Found " + 
                             std::to_string(active_ports.size()) + " seeders\n" +
                             "Download started. File: " + filename + " (" + 
-                            std::to_string(total_chunks) + " chunks)\n";
+                            std::to_string(total_chunks) + " chunks)\n";    
     send(client_socket, seeder_msg.c_str(), seeder_msg.size(), 0);
 
     // Create chunks and distribute across all available ports
@@ -437,13 +426,10 @@ void handle_client(int client_socket, int current_port) {
         });
     }
 
-    // Wait for all downloads to complete
-    for (auto& thread : download_threads) {
+    for (auto& thread : download_threads) {    // Wait for all downloads to complete
         thread.join();
     }
-
-    // Reassemble file from chunks
-    std::ofstream outfile(filename, std::ios::binary);
+    std::ofstream outfile(filename, std::ios::binary); // Reassemble file from chunks
     if (outfile) {
         for (const auto& chunk : chunks) {
             if (chunk.completed) {
@@ -463,8 +449,8 @@ void handle_client(int client_socket, int current_port) {
         active_downloads[filename] = false;
     }
 }
-
-void* server_thread(void* arg) {
+//== SERVER THREAD FUNCTIONS=====
+void* server_thread(void* arg) { // Dedicated thread for each server
     int server_fd = *(int*)arg;
     int current_port;
     socklen_t addrlen;
@@ -474,7 +460,7 @@ void* server_thread(void* arg) {
     getsockname(server_fd, (sockaddr*)&addr, &len);
     current_port = ntohs(addr.sin_port);
 
-    while (true) {
+    while (true) { // Accept connections from clients
         sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
         int client_socket = accept(server_fd, (sockaddr*)&client_addr, &client_len);
@@ -583,10 +569,9 @@ int main() {
                 continue;
             }
             
-            // Get all available files from active ports
-            std::vector<FileInfo> files;
-            std::unordered_set<std::string> seen;
-            std::map<std::string, std::vector<FileInfo>> files_by_key_id;
+            std::vector<FileInfo> files; // Get all available files from active ports
+            std::unordered_set<std::string> seen; // for file duplicates
+            std::map<std::string, std::vector<FileInfo>> files_by_key_id; 
 
             for (int active_port : active_ports) {
                 std::vector<FileInfo> port_files = request_files_from_port(active_port);
@@ -595,10 +580,8 @@ int main() {
                     std::string file_key = file.filepath + "|" + std::to_string(file.file_size);
                     if (seen.count(file_key) == 0) {
                         files.push_back(file);
-                        seen.insert(file_key);
-                        
-                        // Group files by key_id (folder number)
-                        if (!file.key_id.empty()) {
+                        seen.insert(file_key);                                             
+                        if (!file.key_id.empty()) { // Group files by key_id (folder number)
                             files_by_key_id[file.key_id].push_back(file);
                         }
                     }
@@ -609,17 +592,13 @@ int main() {
                 std::cout << "No files found with Key IDs.\n";
                 continue;
             }
-            
-            // Display available Key IDs
+                        
             std::cout << "\nAvailable Files:\n";
             std::vector<std::string> key_ids;
             for (const auto& entry : files_by_key_id) {
                 key_ids.push_back(entry.first);
-                //std::cout << "[" << key_ids.size() << "] Key ID: " << entry.first << " (" << entry.second.size() << " files)\n";
                 std::cout << "[" << entry.first << "]";
-                
-                // Show files in this key_id
-                for (const auto& file : entry.second) {
+                for (const auto& file : entry.second) { // Show files in this key_id
                     std::string filename = file.filepath;
                     size_t last_slash = file.filepath.find_last_of("/");
                     if (last_slash != std::string::npos) {
@@ -635,22 +614,18 @@ int main() {
             
             std::string selected_key_id;
             bool found_key_id = false;
-            
-            // First try to find direct key_id match
-            if (files_by_key_id.find(file_id_input) != files_by_key_id.end()) {
+                        
+            if (files_by_key_id.find(file_id_input) != files_by_key_id.end()) { // First try to find direct key_id match
                 selected_key_id = file_id_input;
                 found_key_id = true;
             } else {
-                // Try to parse as number and get key_id by index
-                try {
+                try { // Try to parse as number and get key_id by index
                     int file_id_choice = std::stoi(file_id_input);
                     if (file_id_choice >= 1 && file_id_choice <= key_ids.size()) {
                         selected_key_id = key_ids[file_id_choice - 1];
                         found_key_id = true;
                     }
-                } catch (const std::exception&) {
-                    // Invalid input
-                }
+                } catch (const std::exception&) { /*Invalid input*/ }
             }
             
             if (!found_key_id) {
@@ -659,12 +634,10 @@ int main() {
             }
             
             std::vector<FileInfo>& selected_files = files_by_key_id[selected_key_id];
-            
             std::cout << "Locating seeders..";
-            std::flush(std::cout);
+            std::flush(std::cout); 
             
-            // Count how many active ports actually have files from this key_id
-            int seeders_with_files = 0;
+            int seeders_with_files = 0; // Count how many active ports have files from this key_id
             for (int active_port : active_ports) {
                 std::vector<FileInfo> port_files = request_files_from_port(active_port);
                 bool has_key_id_files = false;
@@ -684,12 +657,11 @@ int main() {
                 continue;
             }
             
-            std::cout << " Found " << seeders_with_files << " seeders\n";
-            
+            std::cout << " Found " << seeders_with_files << " seeders\n";  
             bool any_download_active = false;
             std::vector<std::string> active_file_names;
             {
-                std::lock_guard<std::mutex> lock(download_mutex);
+                std::lock_guard<std::mutex> lock(download_mutex); // Lock download mutex
                 for (const auto& file : selected_files) {
                     std::string filename = file.filepath;
                     size_t last_slash = file.filepath.find_last_of("/");
@@ -752,8 +724,7 @@ int main() {
                         }
                     }
                     
-                    // Check if file already exists
-                    std::ifstream check_file(local_file_path);
+                    std::ifstream check_file(local_file_path); // Check if file already exists
                     if (check_file.good()) {
                         check_file.close();
                         std::cout << "File " << local_file_path << " already exists, skipping.\n";
@@ -772,10 +743,8 @@ int main() {
                     size_t file_size = selected_file.file_size;
                     size_t total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
                     
-                    std::cout << "Starting download: " << filename << " -> " << local_file_path << " (" << total_chunks << " chunks)\n";
-                    
-                    // Create chunks and distribute across ALL available ports
-                    std::vector<ChunkDownload> chunks;
+                    std::cout << "Starting download: " << filename << " -> " << local_file_path << " (" << total_chunks << " chunks)\n";                
+                    std::vector<ChunkDownload> chunks; // Create chunks and distribute across ALL available ports
                     for (size_t i = 0; i < total_chunks; ++i) {
                         size_t start_offset = i * CHUNK_SIZE;
                         size_t chunk_size = std::min(CHUNK_SIZE, file_size - start_offset);
@@ -784,8 +753,7 @@ int main() {
                         chunks.emplace_back(i, target_port, start_offset, chunk_size);
                     }
                     
-                    // Download chunks simultaneously from ALL ports
-                    std::vector<std::thread> chunk_threads;
+                    std::vector<std::thread> chunk_threads; // Download chunks simultaneously from ALL ports
                     std::atomic<int> completed_chunks(0);
                     
                     for (auto& chunk : chunks) {
@@ -796,12 +764,11 @@ int main() {
                         });
                     }
                     
-                    // Wait for all chunk downloads to complete
-                    for (auto& thread : chunk_threads) {
+                    for (auto& thread : chunk_threads) { // Wait for all chunk downloads to complete
                         thread.join();
                     }
                     
-                    std::ofstream outfile(local_file_path, std::ios::binary);
+                    std::ofstream outfile(local_file_path, std::ios::binary); // Reassemble file from chunks
                     if (outfile) {
                         for (const auto& chunk : chunks) {
                             if (chunk.completed) {
@@ -826,8 +793,7 @@ int main() {
                 });
             }
             
-            // Wait for all file downloads to complete
-            for (auto& thread : file_download_threads) {
+            for (auto& thread : file_download_threads) { // Wait for all file downloads to complete
                 thread.join();
             }
             
@@ -850,7 +816,6 @@ int main() {
             std::cout << "Invalid option. Try again.\n";
         }
     }
-
     close(server_fd);
     return 0;
 }
