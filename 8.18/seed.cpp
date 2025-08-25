@@ -25,8 +25,61 @@ g++ seed.cpp -o seed -lpthread
 #include <atomic>
 #include <chrono>
 #include <iomanip>
+#include <memory>
 
-//==CONFIG CONSTANTS=====
+// =====FILE AND CHUNK INFORMATION=====
+struct FileInfo {           // file info stored by a seeder
+    std::string filepath;
+    std::string key_id;
+    size_t file_size;       // File size in bytes
+    std::string seed_info;  // Seed info
+};
+
+struct DownloadProgress {
+    std::string filename;
+    size_t total_bytes;
+    std::atomic<size_t> downloaded_bytes;
+    std::atomic<int> completed_chunks;
+    int total_chunks;
+    std::chrono::steady_clock::time_point start_time;
+    std::atomic<bool> is_complete;
+    std::string final_status;
+    
+    DownloadProgress(const std::string& name, size_t total, int chunks) 
+        : filename(name), total_bytes(total), downloaded_bytes(0), 
+          completed_chunks(0), total_chunks(chunks), 
+          start_time(std::chrono::steady_clock::now()), is_complete(false) {}
+    
+    void update_progress(size_t chunk_bytes) {
+        downloaded_bytes += chunk_bytes;
+        completed_chunks++;
+    }
+    
+    void mark_complete(const std::string& status) {
+        final_status = status;
+        is_complete = true;
+    }
+};
+
+struct ChunkDownload {      // chunk info stored by a seeder
+    int chunk_id;           
+    int port;               
+    size_t start_offset;    // byte offset of chunk in file
+    size_t chunk_size;      // size of chunk in bytes (32 bytes)
+    std::vector<char> data; // data of chunk
+    bool completed;         // true if chunk is downloaded
+    
+    ChunkDownload(int id, int p, size_t start, size_t size)     
+            : chunk_id(id), port(p), start_offset(start), chunk_size(size), completed(false) {
+        data.resize(size);
+    }
+};
+
+// Global variables for background download management
+std::map<std::string, std::shared_ptr<DownloadProgress>> active_progress; // Track active downloads
+std::mutex progress_mutex; // Mutex for progress tracking
+
+// ==CONFIG CONSTANTS=====
 #define START_PORT 9005
 #define END_PORT 9009
 const size_t CHUNK_SIZE = 32; // safer than #define, defines size of each chunk in bytes
@@ -47,53 +100,6 @@ std::map<std::string, bool> active_downloads;        // file -> true if download
 std::mutex download_mutex;                           // mutex for thread-safe download operations
 std::mutex console_mutex;                            // mutex for thread-safe console output
 
-// =====FILE AND CHUNK INFORMATION=====
-struct FileInfo {           // file info stored by a seeder
-    std::string filepath;
-    std::string key_id;
-    size_t file_size;       // File size in bytes
-    std::string seed_info;  // Seed info
-};
-
-struct DownloadProgress {
-    std::string filename;
-    size_t total_bytes;
-    std::atomic<size_t> downloaded_bytes;
-    std::atomic<int> completed_chunks;
-    int total_chunks;
-    std::chrono::steady_clock::time_point start_time;
-    
-    DownloadProgress(const std::string& name, size_t total, int chunks) 
-        : filename(name), total_bytes(total), downloaded_bytes(0), 
-          completed_chunks(0), total_chunks(chunks), 
-          start_time(std::chrono::steady_clock::now()) {}
-    
-    void update_progress(size_t chunk_bytes) {
-        downloaded_bytes += chunk_bytes;
-        completed_chunks++;
-        
-        std::lock_guard<std::mutex> lock(console_mutex);
-        double percentage = (double)downloaded_bytes / total_bytes * 100.0;
-        std::cout << "\r\"" << filename << "\" " 
-                  << downloaded_bytes << "b/" << total_bytes << "b (" 
-                  << std::fixed << std::setprecision(1) << percentage << "%)" 
-                  << std::flush;
-    }
-};
-
-struct ChunkDownload {      // chunk info stored by a seeder
-    int chunk_id;           
-    int port;               
-    size_t start_offset;    // byte offset of chunk in file
-    size_t chunk_size;      // size of chunk in bytes (32 bytes)
-    std::vector<char> data; // data of chunk
-    bool completed;         // true if chunk is downloaded
-    
-    ChunkDownload(int id, int p, size_t start, size_t size)     
-            : chunk_id(id), port(p), start_offset(start), chunk_size(size), completed(false) {
-        data.resize(size);
-    }
-};
 // =====PORT HANDLING FUNCTIONS=====
 int find_available_port(int& server_fd, sockaddr_in& address) {
     int opt = 1;
@@ -535,6 +541,159 @@ bool create_directory_recursive(const std::string& path) {
     return mkdir(path.c_str(), 0755) == 0;
 }
 
+void download_files_background(const std::vector<FileInfo>& selected_files, 
+                              const std::vector<int>& active_ports,
+                              const std::string& current_seed_folder,
+                              const std::string& selected_key_id) {
+    
+    std::vector<std::thread> file_download_threads;
+    
+    for (const auto& selected_file : selected_files) {
+        file_download_threads.emplace_back([selected_file, active_ports, current_seed_folder, selected_key_id]() {
+            std::string filename = selected_file.filepath;
+            size_t last_slash = selected_file.filepath.find_last_of("/");
+            if (last_slash != std::string::npos) {
+                filename = selected_file.filepath.substr(last_slash + 1);
+            }
+            
+            std::string local_folder_path = current_seed_folder + "/" + selected_key_id;
+            std::string local_file_path = local_folder_path + "/" + filename;
+            
+            if (!create_directory_recursive(local_folder_path)) {
+                std::lock_guard<std::mutex> lock(progress_mutex);
+                if (active_progress[filename]) {
+                    active_progress[filename]->mark_complete("Failed: Could not create directory");
+                }
+                return;
+            }
+            
+            std::ifstream check_file(local_file_path);
+            bool file_exists = check_file.good();
+            check_file.close();
+            
+            {
+                std::lock_guard<std::mutex> lock(download_mutex);
+                if (active_downloads[filename]) {
+                    std::lock_guard<std::mutex> progress_lock(progress_mutex);
+                    if (active_progress[filename]) {
+                        active_progress[filename]->mark_complete("Download already in progress");
+                    }
+                    return;
+                }
+                active_downloads[filename] = true;
+            }
+            
+            size_t file_size = selected_file.file_size;
+            size_t total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            
+            std::vector<ChunkDownload> chunks;
+            for (size_t i = 0; i < total_chunks; ++i) {
+                size_t start_offset = i * CHUNK_SIZE;
+                size_t chunk_size = std::min(CHUNK_SIZE, file_size - start_offset);
+                int target_port = active_ports[i % active_ports.size()];
+                
+                chunks.emplace_back(i, target_port, start_offset, chunk_size);
+            }
+            
+            std::vector<std::thread> chunk_threads;
+            std::atomic<int> completed_chunks(0);
+            
+            std::shared_ptr<DownloadProgress> progress;
+            {
+                std::lock_guard<std::mutex> lock(progress_mutex);
+                if (active_progress[filename]) {
+                    progress = active_progress[filename];
+                }
+            }
+            
+            const size_t MAX_CONCURRENT_CHUNKS = std::min((size_t)10, total_chunks);
+            size_t chunks_processed = 0;
+            
+            while (chunks_processed < total_chunks) {
+                size_t batch_size = std::min(MAX_CONCURRENT_CHUNKS, total_chunks - chunks_processed);
+                
+                for (size_t i = 0; i < batch_size; ++i) {
+                    auto& chunk = chunks[chunks_processed + i];
+                    chunk_threads.emplace_back([&chunk, &selected_file, &completed_chunks, progress]() {
+                        if (download_chunk_from_port(chunk.port, selected_file.filepath, chunk)) {
+                            completed_chunks++;
+                            if (progress) {
+                                progress->update_progress(chunk.chunk_size);
+                            }
+                        }
+                    });
+                }
+                
+                for (auto& thread : chunk_threads) {
+                    thread.join();
+                }
+                chunk_threads.clear();
+                
+                chunks_processed += batch_size;
+            }
+            
+            std::string final_path = local_file_path;
+            if (file_exists) {
+                // Create a unique filename for duplicates
+                size_t dot_pos = filename.find_last_of('.');
+                std::string base_name = (dot_pos != std::string::npos) ? filename.substr(0, dot_pos) : filename;
+                std::string extension = (dot_pos != std::string::npos) ? filename.substr(dot_pos) : "";
+                
+                int counter = 1;
+                do {
+                    std::string new_filename = base_name + "_" + std::to_string(counter) + extension;
+                    final_path = local_folder_path + "/" + new_filename;
+                    counter++;
+                } while (std::ifstream(final_path).good());
+            }
+            
+            std::ofstream outfile(final_path, std::ios::binary);
+            if (outfile) {
+                for (const auto& chunk : chunks) {
+                    if (chunk.completed) {
+                        outfile.write(chunk.data.data(), chunk.data.size());
+                    }
+                }
+                outfile.close();
+                
+                std::string success_status;
+                if (file_exists) {
+                    success_status = "Success (" + std::to_string(completed_chunks.load()) + 
+                                   "/" + std::to_string(total_chunks) + " chunks) -> " + final_path + " (downloaded from all duplicate sources)";
+                } else {
+                    success_status = "Success (" + std::to_string(completed_chunks.load()) + 
+                                   "/" + std::to_string(total_chunks) + " chunks) -> " + final_path;
+                }
+                
+                std::lock_guard<std::mutex> lock(progress_mutex);
+                if (active_progress[filename]) {
+                    active_progress[filename]->mark_complete(success_status);
+                }
+                
+                download_status[filename] = success_status;
+            } else {
+                std::string error_status = "Failed: Could not create output file at " + final_path;
+                
+                std::lock_guard<std::mutex> lock(progress_mutex);
+                if (active_progress[filename]) {
+                    active_progress[filename]->mark_complete(error_status);
+                }
+                
+                download_status[filename] = error_status;
+            }
+            
+            {
+                std::lock_guard<std::mutex> lock(download_mutex);
+                active_downloads[filename] = false;
+            }
+        });
+    }
+    
+    for (auto& thread : file_download_threads) {
+        thread.join();
+    }
+}
+
 int main() {
     int server_fd;
     sockaddr_in address{};
@@ -621,8 +780,8 @@ int main() {
                 continue;
             }
             
-            std::vector<FileInfo> files; // Get all available files from active ports
-            std::unordered_set<std::string> seen; // for file duplicates
+            std::vector<FileInfo> files;
+            std::unordered_set<std::string> seen;
             std::map<std::string, std::vector<FileInfo>> files_by_key_id; 
 
             for (int active_port : active_ports) {
@@ -633,7 +792,7 @@ int main() {
                     if (seen.count(file_key) == 0) {
                         files.push_back(file);
                         seen.insert(file_key);                                             
-                        if (!file.key_id.empty()) { // Group files by key_id (folder number)
+                        if (!file.key_id.empty()) {
                             files_by_key_id[file.key_id].push_back(file);
                         }
                     }
@@ -650,7 +809,7 @@ int main() {
             for (const auto& entry : files_by_key_id) {
                 key_ids.push_back(entry.first);
                 std::cout << "[" << entry.first << "]";
-                for (const auto& file : entry.second) { // Show files in this key_id
+                for (const auto& file : entry.second) {
                     std::string filename = file.filepath;
                     size_t last_slash = file.filepath.find_last_of("/");
                     if (last_slash != std::string::npos) {
@@ -667,17 +826,17 @@ int main() {
             std::string selected_key_id;
             bool found_key_id = false;
                         
-            if (files_by_key_id.find(file_id_input) != files_by_key_id.end()) { // First try to find direct key_id match
+            if (files_by_key_id.find(file_id_input) != files_by_key_id.end()) {
                 selected_key_id = file_id_input;
                 found_key_id = true;
             } else {
-                try { // Try to parse as number and get key_id by index
+                try {
                     int file_id_choice = std::stoi(file_id_input);
                     if (file_id_choice >= 1 && file_id_choice <= key_ids.size()) {
                         selected_key_id = key_ids[file_id_choice - 1];
                         found_key_id = true;
                     }
-                } catch (const std::exception&) { /*Invalid input*/ }
+                } catch (const std::exception&) { }
             }
             
             if (!found_key_id) {
@@ -689,7 +848,7 @@ int main() {
             std::cout << "Locating seeders..";
             std::flush(std::cout); 
             
-            int seeders_with_files = 0; // Count how many active ports have files from this key_id
+            int seeders_with_files = 0;
             for (int active_port : active_ports) {
                 std::vector<FileInfo> port_files = request_files_from_port(active_port);
                 bool has_key_id_files = false;
@@ -710,10 +869,11 @@ int main() {
             }
             
             std::cout << " Found " << seeders_with_files << " seeders\n";  
+            
             bool any_download_active = false;
             std::vector<std::string> active_file_names;
             {
-                std::lock_guard<std::mutex> lock(download_mutex); // Lock download mutex
+                std::lock_guard<std::mutex> lock(download_mutex);
                 for (const auto& file : selected_files) {
                     std::string filename = file.filepath;
                     size_t last_slash = file.filepath.find_last_of("/");
@@ -742,6 +902,12 @@ int main() {
                     filename = file.filepath.substr(last_slash + 1);
                 }
                 std::cout << "Download started. File: " << filename << "\n";
+                
+                size_t file_size = file.file_size;
+                size_t total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+                
+                std::lock_guard<std::mutex> lock(progress_mutex);
+                active_progress[filename] = std::make_shared<DownloadProgress>(filename, file_size, total_chunks);
             }
             
             auto it = port_to_seed.find(port);
@@ -751,141 +917,72 @@ int main() {
             }
             std::string current_seed_folder = base_seed_path + "/" + it->second;
             
-            // Download all files in the selected Key ID simultaneously
-            std::cout << "Downloading " << selected_files.size() << " files from Key ID: " << selected_key_id << "\n";
-            std::cout << "Saving to: " << current_seed_folder << "/" << selected_key_id << "/\n";
+            std::thread background_download(download_files_background, selected_files, active_ports, current_seed_folder, selected_key_id);
+            background_download.detach(); // Let it run in background
             
-            std::vector<std::thread> file_download_threads;
-            
-            for (const auto& selected_file : selected_files) {
-                file_download_threads.emplace_back([&selected_file, &active_ports, current_seed_folder, selected_key_id]() {
-                    std::string filename = selected_file.filepath;
-                    size_t last_slash = selected_file.filepath.find_last_of("/");
-                    if (last_slash != std::string::npos) {
-                        filename = selected_file.filepath.substr(last_slash + 1);
-                    }
-                    
-                    std::string local_folder_path = current_seed_folder + "/" + selected_key_id;
-                    std::string local_file_path = local_folder_path + "/" + filename;
-                    
-                    if (!create_directory_recursive(local_folder_path)) {
-                        std::lock_guard<std::mutex> lock(console_mutex);
-                        std::cout << "\nFailed to create directory: " << local_folder_path << std::endl;
-                        return;
-                    }
-                    
-                    std::ifstream check_file(local_file_path); // Check if file already exists
-                    if (check_file.good()) {
-                        check_file.close();
-                        std::lock_guard<std::mutex> lock(console_mutex);
-                        std::cout << "\nFile " << local_file_path << " already exists, skipping." << std::endl;
-                        return;
-                    }
-                    
-                    {
-                        std::lock_guard<std::mutex> lock(download_mutex);
-                        if (active_downloads[filename]) {
-                            std::lock_guard<std::mutex> console_lock(console_mutex);
-                            std::cout << "\nDownload for " << filename << " already in progress, skipping." << std::endl;
-                            return;
-                        }
-                        active_downloads[filename] = true;
-                    }
-                    
-                    size_t file_size = selected_file.file_size;
-                    size_t total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
-                    
-                    {
-                        std::lock_guard<std::mutex> lock(console_mutex);
-                        std::cout << "\nStarting download: " << filename << " -> " << local_file_path << " (" << total_chunks << " chunks)" << std::endl;
-                    }
-                    
-                    std::vector<ChunkDownload> chunks; // Create chunks and distribute across ALL available ports
-                    for (size_t i = 0; i < total_chunks; ++i) {
-                        size_t start_offset = i * CHUNK_SIZE;
-                        size_t chunk_size = std::min(CHUNK_SIZE, file_size - start_offset);
-                        int target_port = active_ports[i % active_ports.size()]; // Round-robin across ALL ports
-                        
-                        chunks.emplace_back(i, target_port, start_offset, chunk_size);
-                    }
-                    
-                    std::vector<std::thread> chunk_threads; // Download chunks simultaneously from ALL ports
-                    std::atomic<int> completed_chunks(0);
-                    DownloadProgress progress(filename, file_size, total_chunks);
-                    
-                    const size_t MAX_CONCURRENT_CHUNKS = std::min((size_t)10, total_chunks);
-                    size_t chunks_processed = 0;
-                    
-                    while (chunks_processed < total_chunks) {
-                        size_t batch_size = std::min(MAX_CONCURRENT_CHUNKS, total_chunks - chunks_processed);
-                        
-                        for (size_t i = 0; i < batch_size; ++i) {
-                            auto& chunk = chunks[chunks_processed + i];
-                            chunk_threads.emplace_back([&chunk, &selected_file, &completed_chunks, &progress]() {
-                                if (download_chunk_from_port(chunk.port, selected_file.filepath, chunk, &progress)) {
-                                    completed_chunks++;
-                                }
-                            });
-                        }
-                        
-                        for (auto& thread : chunk_threads) {
-                            thread.join();
-                        }
-                        chunk_threads.clear();
-                        
-                        chunks_processed += batch_size;
-                    }
-                    
-                    {
-                        std::lock_guard<std::mutex> lock(console_mutex);
-                        std::cout << std::endl; // New line after progress display
-                    }
-                    
-                    std::ofstream outfile(local_file_path, std::ios::binary); // Reassemble file from chunks
-                    if (outfile) {
-                        for (const auto& chunk : chunks) {
-                            if (chunk.completed) {
-                                outfile.write(chunk.data.data(), chunk.data.size());
-                            }
-                        }
-                        outfile.close();
-                        
-                        download_status[filename] = "Success (" + std::to_string(completed_chunks.load()) + 
-                                                   "/" + std::to_string(total_chunks) + " chunks) -> " + local_file_path;
-                        
-                        std::lock_guard<std::mutex> lock(console_mutex);
-                        std::cout << "Completed: " << filename << " -> " << local_file_path << " (" << completed_chunks.load() << 
-                                    "/" << total_chunks << " chunks)" << std::endl;
-                    } else {
-                        download_status[filename] = "Failed: Could not create output file at " + local_file_path;
-                        std::lock_guard<std::mutex> lock(console_mutex);
-                        std::cout << "Failed to create: " << local_file_path << std::endl;
-                    }
-                    
-                    {
-                        std::lock_guard<std::mutex> lock(download_mutex);
-                        active_downloads[filename] = false;
-                    }
-                });
-            }
-            
-            for (auto& thread : file_download_threads) { // Wait for all file downloads to complete
-                thread.join();
-            }
-            
-            std::cout << "\nAll downloads for Key ID " << selected_key_id << " completed.\n";
-            std::cout << "Files saved to: " << current_seed_folder << "/" << selected_key_id << "/\n";
+            std::cout << "\nReturning to menu...\n";
             
         } else if (choice == 3) {
-            std::cout << "\nDownload status:\n";
-            if (download_status.empty()) {
-                std::cout << "No downloads yet.\n";
-            } else {
-                for (const auto& entry : download_status) {
-                    std::cout << entry.first << ": " << entry.second << "\n";
+            std::cout << "Download status:\n";
+            
+            bool has_active_downloads = false;
+            std::vector<std::shared_ptr<DownloadProgress>> active_downloads_list;
+            
+            {
+                std::lock_guard<std::mutex> lock(progress_mutex);
+                for (const auto& entry : active_progress) {
+                    if (!entry.second->is_complete) {
+                        has_active_downloads = true;
+                        active_downloads_list.push_back(entry.second);
+                    }
                 }
             }
-        } else if (choice == 4) {
+            
+            if (has_active_downloads) {
+                std::cout << "Downloading 1 files from Key ID: (active)\n";
+                
+                while (true) {
+                    bool still_active = false;
+                    {
+                        std::lock_guard<std::mutex> lock(progress_mutex);
+                        for (const auto& progress : active_downloads_list) {
+                            if (!progress->is_complete) {
+                                still_active = true;
+                                double percentage = (progress->total_bytes > 0) ? 
+                                    (double)progress->downloaded_bytes / progress->total_bytes * 100.0 : 0.0;
+                                
+                                std::cout << "\r" << progress->filename << " (" << progress->total_chunks << " chunks) - "
+                                          << "\"" << progress->filename << "\" " 
+                                          << progress->downloaded_bytes << "b/" << progress->total_bytes << "b (" 
+                                          << std::fixed << std::setprecision(1) << percentage << "%)";
+                                std::cout.flush();
+                                break; // Show one at a time for clarity
+                            }
+                        }
+                    }
+                    
+                    if (!still_active) {
+                        std::cout << "\n"; // Move to next line when done
+                        break;
+                    }
+                    
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            }
+            
+            {
+                std::lock_guard<std::mutex> lock(progress_mutex);
+                for (const auto& entry : active_progress) {
+                    if (entry.second->is_complete) {
+                        std::cout << "Completed: " << entry.second->filename << " - " << entry.second->final_status << "\n";
+                    }
+                }
+            }
+            
+            std::cout << "\nReturning to menu...\n";
+        }
+
+        else if (choice == 4) {
             std::cout << "Exiting...\n";
             break;
         } else {
