@@ -75,6 +75,15 @@ struct ChunkDownload {      // chunk info stored by a seeder
     }
 };
 
+// Utility to extract just the filename from a full path
+static std::string extract_filename(const std::string& full_path) {
+    size_t last_slash = full_path.find_last_of("/");
+    if (last_slash == std::string::npos) {
+        return full_path;
+    }
+    return full_path.substr(last_slash + 1);
+}
+
 // Global variables for background download management
 std::map<std::string, std::shared_ptr<DownloadProgress>> active_progress; // Track active downloads
 std::mutex progress_mutex; // Mutex for progress tracking
@@ -741,7 +750,8 @@ int main() {
                 std::vector<FileInfo> port_files = request_files_from_port(active_port);
                 
                 for (const FileInfo& file : port_files) {
-                    std::string file_key = file.filepath + "|" + std::to_string(file.file_size);
+                    // Deduplicate by filename + size so only the first seeder's entry is shown
+                    std::string file_key = extract_filename(file.filepath) + "|" + std::to_string(file.file_size);
                     if (seen.count(file_key) == 0) {
                         files.push_back(file);
                         seen.insert(file_key);
@@ -788,7 +798,8 @@ int main() {
                 std::vector<FileInfo> port_files = request_files_from_port(active_port);
                 
                 for (const FileInfo& file : port_files) {
-                    std::string file_key = file.filepath + "|" + std::to_string(file.file_size);
+                    // Deduplicate by filename + size so only the first seeder's entry is kept
+                    std::string file_key = extract_filename(file.filepath) + "|" + std::to_string(file.file_size);
                     if (seen.count(file_key) == 0) {
                         files.push_back(file);
                         seen.insert(file_key);                                             
