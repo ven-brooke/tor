@@ -33,6 +33,7 @@ struct FileInfo {           // file info stored by a seeder
     std::string key_id;
     size_t file_size;       // File size in bytes
     std::string seed_info;  // Seed info
+    int source_port;        // Port where this file was listed from (for client-side use)
 };
 
 struct DownloadProgress {
@@ -268,6 +269,7 @@ std::vector<FileInfo> request_files_from_port(int port) { // Request files from 
                     file_info.key_id = key_id;
                     file_info.file_size = std::stoull(size_str); 
                     file_info.seed_info = seed_info;
+                    file_info.source_port = port;
                     files.push_back(file_info); // Add file info to files vector
                 }
             }
@@ -595,12 +597,34 @@ void download_files_background(const std::vector<FileInfo>& selected_files,
             size_t file_size = selected_file.file_size;
             size_t total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
             
+            // Build list of valid source ports that actually have files for this key id
+            std::vector<int> valid_source_ports;
+            for (int p : active_ports) {
+                std::vector<FileInfo> pfiles = request_files_from_port(p);
+                for (const auto& pf : pfiles) {
+                    if (pf.key_id == selected_key_id) {
+                        valid_source_ports.push_back(p);
+                        break;
+                    }
+                }
+            }
+            if (valid_source_ports.empty()) {
+                std::lock_guard<std::mutex> lock(progress_mutex);
+                if (active_progress[filename]) {
+                    active_progress[filename]->mark_complete("Failed: No seeders have the selected file");
+                }
+                {
+                    std::lock_guard<std::mutex> lock(download_mutex);
+                    active_downloads[filename] = false;
+                }
+                return;
+            }
+            
             std::vector<ChunkDownload> chunks;
             for (size_t i = 0; i < total_chunks; ++i) {
                 size_t start_offset = i * CHUNK_SIZE;
                 size_t chunk_size = std::min(CHUNK_SIZE, file_size - start_offset);
-                int target_port = active_ports[i % active_ports.size()];
-                
+                int target_port = valid_source_ports[i % valid_source_ports.size()];
                 chunks.emplace_back(i, target_port, start_offset, chunk_size);
             }
             
@@ -623,8 +647,19 @@ void download_files_background(const std::vector<FileInfo>& selected_files,
                 
                 for (size_t i = 0; i < batch_size; ++i) {
                     auto& chunk = chunks[chunks_processed + i];
-                    chunk_threads.emplace_back([&chunk, &selected_file, &completed_chunks, progress]() {
-                        if (download_chunk_from_port(chunk.port, selected_file.filepath, chunk)) {
+                    chunk_threads.emplace_back([&chunk, &selected_file, &completed_chunks, progress, &valid_source_ports]() {
+                        // Try original port; if fails, try other ports that have the file
+                        if (!download_chunk_from_port(chunk.port, selected_file.filepath, chunk)) {
+                            for (int fallback_port : valid_source_ports) {
+                                if (fallback_port == chunk.port) continue;
+                                ChunkDownload temp(chunk.chunk_id, fallback_port, chunk.start_offset, chunk.chunk_size);
+                                if (download_chunk_from_port(fallback_port, selected_file.filepath, temp)) {
+                                    chunk = std::move(temp);
+                                    break;
+                                }
+                            }
+                        }
+                        if (chunk.completed) {
                             completed_chunks++;
                             if (progress) {
                                 progress->update_progress(chunk.chunk_size);
@@ -775,7 +810,7 @@ int main() {
                     std::cout << file_info.seed_info << " " << filename 
                              << " (" << file_info.file_size << " bytes)";
                     if (!file_info.key_id.empty()) {
-                        std::cout << " [Key: " << file_info.key_id << "]";
+                        //std::cout << " [Key: " << file_info.key_id << "]"; //repetitive key id display
                     }
                     std::cout << "\n";
                 }
